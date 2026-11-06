@@ -1,18 +1,19 @@
 import { useCallback, useRef, useState, useSyncExternalStore } from 'react';
+import { invoke } from '@tauri-apps/api/core';
 import { createEmitter } from '../../lib/createStore';
+import { lirahDir } from '../../lib/lirahPaths';
+import { read, update } from '../../lib/persistence';
 
-// App preferences in one module-level store, persisted under one key.
+// App preferences in one module-level store, saved in ~/.lirah/settings.json
+// through lib/persistence.js (loadSettings must finish before first use).
 //
 // Every tab reads it through useSyncExternalStore, so a change made in one tab
-// reaches every other open tab in the same render. The `storage` event carries
-// changes made by another window of the app.
+// reaches every other open tab in the same render.
 //
 // A few values are "seeded" rather than shared (see useSeededSetting): the
 // store holds the default a new tab starts with, but each tab keeps its own
 // live copy because the value is bound to that tab's running process (sandbox,
 // network isolation, CLI) or layout (sidebar, file view).
-
-export const SETTINGS_KEY = 'lirah:settings:v1';
 
 export const SETTINGS_DEFAULTS = {
   sandboxEnabled: false,
@@ -188,37 +189,18 @@ function readLegacy() {
   return raw;
 }
 
-function persist(next) {
-  try {
-    localStorage.setItem(SETTINGS_KEY, JSON.stringify(next));
-  } catch (error) {
-    console.warn(`Failed to save ${SETTINGS_KEY} to localStorage:`, error);
-  }
-}
+let state = { ...SETTINGS_DEFAULTS };
+let file = null; // set by loadSettings; setSetting needs it
 
-function load() {
-  try {
-    const saved = localStorage.getItem(SETTINGS_KEY);
-    if (saved !== null) {
-      const raw = JSON.parse(saved);
-      const later = readLater(raw);
-      const loaded = sanitize({ ...raw, ...later });
-      if (Object.keys(later).length) persist(loaded);
-      return loaded;
-    }
-  } catch { /* corrupt blob or storage unavailable: fall through */ }
-  const migrated = sanitize({ ...readLegacy(), ...readLater({}) });
-  persist(migrated);
-  return migrated;
-}
-
-let state = load();
-// Listens for other windows' writes only while something is subscribed.
-const { subscribe: subscribeSettings, emit } = createEmitter({
-  onStart: () => window.addEventListener('storage', onStorage),
-  onStop: () => window.removeEventListener('storage', onStorage),
-});
+const { subscribe: subscribeSettings, emit } = createEmitter();
 export { subscribeSettings };
+
+// Read the user layer from ~/.lirah/settings.json. Call it (and wait) before
+// React renders; after that getSettings() is synchronous.
+export async function loadSettings() {
+  file = `${lirahDir(await invoke('get_home_dir'))}/settings.json`;
+  state = sanitize((await read(file))?.data);
+}
 
 export function getSettings() {
   return state;
@@ -230,18 +212,11 @@ export function setSetting(key, value) {
   const next = typeof value === 'function' ? value(prev) : value;
   if (Object.is(prev, next)) return;
   state = { ...state, [key]: next };
-  persist(state);
   emit();
-}
-
-// Another window wrote the key (or cleared storage): reload and notify.
-function onStorage(e) {
-  if (e.key !== null && e.key !== SETTINGS_KEY) return;
-  try {
-    const saved = e.key === null ? null : e.newValue;
-    state = saved ? sanitize(JSON.parse(saved)) : { ...SETTINGS_DEFAULTS };
-  } catch { return; }
-  emit();
+  // The file holds only what the user changed; defaults stay in code.
+  update(file, (data) => ({ ...data, [key]: next })).catch((error) => {
+    console.error(`Failed to save ${key}:`, error);
+  });
 }
 
 // Setters are created once per key so callers can list them as stable deps.
